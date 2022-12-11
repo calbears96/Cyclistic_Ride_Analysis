@@ -1,0 +1,496 @@
+---
+title: "How Does a Bike-Share Navigate Speedy Success?"
+author: "Mike Gessner"
+date: "2022-11-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(xlsx)
+library(dplyr)
+library(ggplot2)
+library(zoo)
+library(janitor)
+library(lubridate)
+library(stringr)
+library(geosphere)
+library(scales)
+```
+
+## Business Task
+
+We are going to use historical ride data to answer the following question: How do annual members differ from casual riders in their use of Cylcistic bikes? Answering this question wil give incites to Cyclistic executives to help them convert casual riders to annual members.
+
+## Data Preparation
+
+The data is located at https://divvy-tripdata.s3.amazonaws.com/index.html and we will use the previous 12 months of monthly data from November 2021 through October 2022. The data is organized in monthly files that contain information identifying a bike rental, the type of membership (e.g., annual versus casual), where the bike was picked up (e.g., a station name), what time the rental started, where the bike was returned (e.g., a station name), and what time the rental bike was returned. Additionally, there is information about the station (the unique station identifier including name) and it's geographical location based on latitude and longitude.
+
+Data was downloaded to local storage and then read into R to create a large dataframe containing 12 months of data.
+
+### Credibility and Other Data Issues
+
+There are several issues with the data that need to be addressed before analyzing it. First, there are many observations that are missing a station identifier, a station name, etc.
+
+Second, there are some issues with the station names. There are inconsistencies with naming protocols and several stations have multiple names. Those most be resolved.
+
+Third, the geo location data is also inconsistent and is not precise.
+
+## Process
+
+For the analysis and cleaning of the data, we use R.
+
+To read the data into R we do the following:
+
+```{r read_cyclistic_data}
+#Set the working directory that contains the csv files to read into R
+
+#setwd("~/Documents/GoogleAnalytics")
+#files <- list.files(path = "~/Documents/GoogleAnalytics/", pattern = "\\.csv$")
+
+#Use a for loop to read in the 12 months of data and append them into one large csv file
+#DF <-  read.csv(files[1])
+#for (f in files[-1]) DF <- rbind(DF, read.csv(f))   
+#write.csv(DF, "last12months_tripdata.csv", row.names=FALSE, quote=FALSE)
+
+#read in the large csv file
+TripData2022 = read.csv("~/Documents/GoogleAnalytics/last12months_tripdata.csv")
+
+```
+
+Once read in, we can begin the cleaning and transformation process
+
+### Creating new variables
+
+The date and time stamps need to be converted to the correct format. Once done, we create a new variable called TripDuration that determines how long (in minutes) each rental took. We also create another varible called WeekDay which shows the day of the week for each rental. We suspect that casual and annual members use the bikes differently and this may show up on the days of the week.
+
+We create these variables using the dplyr package and piping:
+
+```{r new variables}
+TripData2022 = TripData2022 %>% mutate(StartDate= ymd_hms(started_at, tz=Sys.timezone()),
+                                       EndDate = ymd_hms(ended_at, tz=Sys.timezone()),
+                                      TripDuration = as.numeric(difftime(EndDate, StartDate, units = "mins")),
+                                      MonthYear = format(as.Date(StartDate), "%m-%Y"),
+                                      WeekDay = weekdays(as.Date(StartDate)))
+```
+
+### Begin cleaning
+
+Next, we need to throw out observations with erors. We remove trips that have a negative or zero trip duration. We remove trips that lasted more that 24 hours (1440 minutes). We also delete observations with no station id number, no station name, and those with blank latitude or longitude coordinates. Finally, we delete duplicate observations based on the Ride ID.
+
+```{r first cleaning step}
+TripData2022 = TripData2022 %>% filter(TripDuration > 1, 
+                        TripDuration < 1440, #remove trips of greater than 24 hrs
+                        start_station_id != "", #remove blank start station id
+                        end_station_name !="", #reomve blank end station name
+                        end_station_id !="", #remove blank end station id
+                        start_station_name !="", #remove blank start station name
+                        !is.na(start_lat), #remove blank start lat
+                        !is.na(start_lng), #remove blank start lng
+                        !is.na(end_lat), #remove blank end lat
+                        !is.na(end_lng)) #remove blank end lng
+
+TripData2022 = TripData2022 %>% distinct(ride_id, .keep_all = TRUE) #remove duplicate ride id from data
+```
+
+Next up is cleaning the station names. There were several station names that had 'amp;' rather than just the '&' sign. So we used string_replace to remove that and replace it with blank space. There were also several stations with (Temp) in their names, so we use string_replace to find that pattern and replace it with blank space. We also removed parts of the name like 'Public Rack -' with blank space as well as removed misspelled names.
+
+From that cleaning step, we outputted a csv file with the unique station ids to identify duplicate station id ids using Google Sheets. Using conditional formatting, we highlighted duplicate station id numbers that had different names. Next, the stations names were changed to have a consistent station naming policy. In other words, the station ids had distinct and cosistent names.
+
+Once that was done, some of the latitude and lognitude coordinates are slightly off. We created an average latitude and longitude coordinates and then created another variable that rounded the latitude and longitude coordinates to 2 digits.
+
+Next, we created a trip length variable using the geospere package and finding the difference in starting and ending coordinates. Then, a trip speed variable was created to help filter out unusually fast trips given limitations of the bikes (and humans) and filtered out observations where the trip speed. Note that the distance calculated of each trip is an estimate and assumes that the trip followed a grid pattern to estimate the distance. We do not observe the actual path taken, which of course can vary for each trip and/or rider. The trip distance is measured in miles and speed is calculated in miles per hour. The trip speed is an estimate based on the assumed path so it is likely that this estimated trip speed is faster than reality.
+
+```{r clean station names}
+
+TripData2022 = TripData2022 %>% 
+        mutate(start_station_name = str_replace_all(start_station_name, "amp;", "")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, " \\([^()]{0,}\\)", "")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, 'Public Rack - ', "")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, ' - midblock', "")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, 'Broadway & Wilson - Truman College Vaccination Site', "Broadway & Wilson Ave")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, ' Vaccination Site', "")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, 'Library - North', "Library N")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, 'City Rack - ', "")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, 'Ave - north corner', "Ave N")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, 'Public  Rack - ', "")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, '61st Pl E ', "61st Pl")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, 'Pubic Rack - ', "")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, '63rd St - SE', "63rd St S")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, '63rd St - NE', "63rd St N")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, 'Garfield Blvd N', "Garfield Blvd")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, 'Kedzie Ave & 61st Pl W', "Kedzie Ave & 61st Pl")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, '18th St ()', "18th St")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, 'Elizabeth (May) St & Fulton St', "Elizabeth St & Fulton St")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, 'Buckingham Fountain ()', "Buckingham Fountain")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, 'Campbell Ave & Montrose Ave ()', "Campbell Ave & Montrose Ave")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, 'Racine Ave & Fullerton Ave ()', "Racine Ave & Fullerton Ave")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, 'Lincoln Ave & Belmont Ave ()', "Lincoln Ave & Belmont Ave")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, 'Channel Trail & Argyle St',"Channel Trail & Argyle Ave")) %>%
+        mutate(start_station_name = str_replace_all(start_station_name, 'Kedzie Ave & 61st Pl E', "Kedzie Ave & 61st Pl")) %>%   
+        mutate(start_station_name = str_replace_all(start_station_name, 'Prairie Ave & 47th St ', "Prairie Ave & 47th St")) %>% 
+        mutate(start_station_name = str_replace_all(start_station_name, '()', "")) %>%  
+        mutate(start_station_name = str_replace_all(start_station_name, ' - Velasquez Institute', "")) %>%  
+        mutate(start_station_name = str_replace_all(start_station_name, 'Halsted St & 18th St()', "Halsted St & 18th St")) %>%  
+        mutate(start_station_name = str_replace_all(start_station_name, 'Halsted & 63rd - Kennedy-King', "Halsted St & 63rd St")) %>%  
+        mutate(start_station_name = str_replace_all(start_station_name, 'Western & 28th', "Western Ave & 28th St")) %>% 
+        #collapse different names into one
+        mutate(start_station_name = str_replace(start_station_name, 'Halsted St & Clybourn Ave', "Pulaski Rd & 21st St")) %>%
+        mutate(start_station_name = str_replace(start_station_name, 'Ridge Blvd & Howard St', "Hamlin Ave & Grand Ave")) %>%
+        mutate(start_station_name = str_replace(start_station_name, 'Paulina St & Howard St', "Hamlin Ave & Chicago Ave")) %>%        
+        mutate(start_station_name = str_replace(start_station_name, 'Clark St & Jarvis Ave', "Pulaski Rd & Armitage Ave")) %>%        
+        mutate(start_station_name = str_replace(start_station_name, 'Conservatory Dr & Lake St', "Keystone Ave & North Ave")) %>%           
+        mutate(start_station_name = str_replace(start_station_name, 'Wolcott Ave & Fargo Ave', "Kostner Ave & North Ave")) %>%           
+        mutate(start_station_name = str_replace(start_station_name, 'Greenview Ave & Jarvis Ave', "Karlov Ave & Kamerling Ave")) %>%         
+        mutate(start_station_name = str_replace(start_station_name, 'Eastlake Ter & Rogers Ave', "Eastlake Ter & Howard St")) %>%  
+        mutate(start_station_name = str_replace(start_station_name, 'Pulaski Rd & Roosevelt Rd', "Eastlake Ter & Howard St")) %>%        
+        mutate(start_station_name = str_replace(start_station_name, 'Glenwood Ave & Touhy Ave', "Kedzie Ave & Arthington St")) %>%        
+        mutate(start_station_name = str_replace(start_station_name, 'Western Ave & Howard St', "Roswell B. Mason Elementary School")) %>%           
+        mutate(start_station_name = str_replace(start_station_name, 'Pulaski Rd & Lake St', "Pulaski Rd & 15th St")) %>%           
+        mutate(start_station_name = str_replace(start_station_name, 'Karlov Ave & Madison St', "California Ave & Ogden Ave")) %>%   
+        mutate(start_station_name = str_replace(start_station_name, 'Pulaski Rd & Congress Pkwy', "Zapata Academy")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Kostner Ave & Lake St', "Keeler Ave & 26th St")) %>%           
+        mutate(start_station_name = str_replace(start_station_name, 'Laramie Ave & Madison St', "Whipple St & 26th St")) %>%         
+        mutate(start_station_name = str_replace(start_station_name, 'Laramie Ave & Gladys Ave', "Cicero Ave & Roscoe St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Kostner Ave & Adams St', "Linder Ave & Belmont Ave")) %>%            
+        mutate(start_station_name = str_replace(start_station_name, 'Damen Ave & Pershing Rd', "Cicero Ave & Wellington Ave")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Marshfield Ave & 44th St', "Laramie Ave & Fullerton Ave")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Elizabeth St & 47th St', "Lorel Ave & Chicago Ave")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Damen Ave & 51st St', "Cicero Ave & Le Moyne St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Throop St & 52nd St', "Spencer Elementary Technology Academy")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Racine Ave & Garfield Blvd', "Menard Ave & Dakin St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Marshfield Ave & 59th St', "Austin Ave & Roscoe St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Damen Ave & 59th St', "Melvina Ave & Belmont Ave")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Racine Ave & 61st St', "Menard Ave & Belmont Ave")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Racine Ave & 65th St', "Austin Ave & Wellington Ave")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'May St & 69th St', "Harvey Ave & North Ave")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Woodlawn Ave & 75th St', "Menard Ave & Grand Ave")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Evans Ave & 75th St', "McVicker Ave & Grand Ave")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Vernon Ave & 75th St', "Austin Blvd & North Ave")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'State St & 76th St', "Hiawatha Park")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Cottage Grove Ave & 78th St', "Pittsburgh Ave & Irving Park")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Greenwood Ave & 79th St', "Plainfield Ave & Irving Park Rd")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Stony Island Ave & South Chicago Ave', "Ozark Ave & Addison St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Phillips Ave & 79th St', "Oketo Ave & Belmont Ave")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'MLK Jr Dr & 83rd St', "Stewart Ave & 123rd St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'South Chicago Ave & 83rd St', "Yale Ave & 119th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Kilbourn Ave & Irving Park Rd', "Ada St & 117th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Knox Ave & Montrose Ave', "Eggleston Ave & 115th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Halsted St & 59th St', "Wallace St & 112 St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Wabash Ave & 87th St', "Michigan Ave & 113th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Benson Ave & Church St', "Cottage Grove Ave & 111th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Valli Produce - Evanston Plaza', "Avenue J & 112th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Dodge Ave & Church St', "Ewing Ave & 112th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Sheridan Rd & Noyes St', "Wentworth Ave & 103rd St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'University Library', "Parnell Ave & 103rd St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Orleans St & Chestnut St', "Ada St & 95th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Michigan Ave & 8th St', "Halsted St & 102nd St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Malcolm X College', "Yates Ave & 100th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Orleans St & Hubbard St', "Ewing Ave & 101st St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Wood St & Chicago Ave', "Ewing Ave & 96th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Clinton St & Jackson Blvd', "Ewing Ave & Indianapolis Ave")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Lakefront Trail & Wilson Ave', "Ewing Ave & 99th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Latrobe Ave & Chicago Ave', "Justine St & 87th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Western Ave & Fillmore St', "Wabash Ave & 87th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'State St & 54th St', "Cottage Grove Ave & 87th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Stewart Ave & 63rd St', "Cottage Grove Ave & 92nd St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Eggleston Ave & 69th St', "Houston Ave & 91st St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Michigan Ave & 71st St', "Commercial Ave & 89th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Rhodes Ave & 71st St', "Muskegon Ave & 89th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Cornell Dr & Hayes Dr', "Loomis Blvd & 83rd St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Hoyne Ave & Balmoral Ave', "Sangamon St & 79th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Leavitt St & Division St', "King Dr & 83rd St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Evanston Civic Center', "Langley Ave & 79th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Dodge Ave & Mulford St', "Cottage Grove & 86th St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'South Chicago Ave & Elliot Ave', "83rd St Metra")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Green St & Randolph St', "Green St & Washington Blvd")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Bissell St & Armitage Ave', "Sheridan Rd & Argyle St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'WEST CHI-WATSON', "WestChi")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Base - 2132 W Hubbard Warehouse', "Base - 2132 W Hubbard")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Morgan St & Lake St', "Sangamon St & Lake St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'DuSable Lake Shore Dr & Ohio St', "McClurg Ct & Ohio St")) %>%          
+        mutate(start_station_name = str_replace(start_station_name, 'Lincoln Ave & Roscoe St', "Wood St & Webster Ave")) %>%
+
+#now replace the end_station_names like above
+        mutate(end_station_name = str_replace_all(end_station_name, "amp;", "")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, " \\([^()]{0,}\\)", "")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, 'Public Rack - ', "")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, ' - midblock', "")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, 'Broadway & Wilson - Truman College Vaccination Site', "Broadway & Wilson Ave")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, ' Vaccination Site', "")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, 'Library - North', "Library N")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, 'City Rack - ', "")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, 'Ave - north corner', "Ave N")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, 'Public  Rack - ', "")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, '61st Pl E ', "61st Pl")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, 'Pubic Rack - ', "")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, '63rd St - SE', "63rd St S")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, '63rd St - NE', "63rd St N")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, 'Garfield Blvd N', "Garfield Blvd")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, 'Kedzie Ave & 61st Pl W', "Kedzie Ave & 61st Pl")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, '18th St ()', "18th St")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, 'Elizabeth (May) St & Fulton St', "Elizabeth St & Fulton St")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, 'Buckingham Fountain ()', "Buckingham Fountain")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, 'Campbell Ave & Montrose Ave ()', "Campbell Ave & Montrose Ave")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, 'Racine Ave & Fullerton Ave ()', "Racine Ave & Fullerton Ave")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, 'Lincoln Ave & Belmont Ave ()', "Lincoln Ave & Belmont Ave")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, 'Channel Trail & Argyle St',"Channel Trail & Argyle Ave")) %>%
+        mutate(end_station_name = str_replace_all(end_station_name, 'Kedzie Ave & 61st Pl E', "Kedzie Ave & 61st Pl")) %>%   
+        mutate(end_station_name = str_replace_all(end_station_name, 'Prairie Ave & 47th St ', "Prairie Ave & 47th St")) %>% 
+        mutate(end_station_name = str_replace_all(end_station_name, '()', "")) %>%  
+        mutate(end_station_name = str_replace_all(end_station_name, ' - Velasquez Institute', "")) %>%  
+        mutate(end_station_name = str_replace_all(end_station_name, 'Halsted St & 18th St()', "Halsted St & 18th St")) %>%  
+        mutate(end_station_name = str_replace_all(end_station_name, 'Halsted & 63rd - Kennedy-King', "Halsted St & 63rd St")) %>%  
+        mutate(end_station_name = str_replace_all(end_station_name, 'Western & 28th', "Western Ave & 28th St")) %>% 
+        #collapse different names into one
+        mutate(end_station_name = str_replace(end_station_name, 'Halsted St & Clybourn Ave', "Pulaski Rd & 21st St")) %>%
+        mutate(end_station_name = str_replace(end_station_name, 'Ridge Blvd & Howard St', "Hamlin Ave & Grand Ave")) %>%
+        mutate(end_station_name = str_replace(end_station_name, 'Paulina St & Howard St', "Hamlin Ave & Chicago Ave")) %>%        
+        mutate(end_station_name = str_replace(end_station_name, 'Clark St & Jarvis Ave', "Pulaski Rd & Armitage Ave")) %>%        
+        mutate(end_station_name = str_replace(end_station_name, 'Conservatory Dr & Lake St', "Keystone Ave & North Ave")) %>%           
+        mutate(end_station_name = str_replace(end_station_name, 'Wolcott Ave & Fargo Ave', "Kostner Ave & North Ave")) %>%           
+        mutate(end_station_name = str_replace(end_station_name, 'Greenview Ave & Jarvis Ave', "Karlov Ave & Kamerling Ave")) %>%         
+        mutate(end_station_name = str_replace(end_station_name, 'Eastlake Ter & Rogers Ave', "Eastlake Ter & Howard St")) %>%  
+        mutate(end_station_name = str_replace(end_station_name, 'Pulaski Rd & Roosevelt Rd', "Eastlake Ter & Howard St")) %>%        
+        mutate(end_station_name = str_replace(end_station_name, 'Glenwood Ave & Touhy Ave', "Kedzie Ave & Arthington St")) %>%        
+        mutate(end_station_name = str_replace(end_station_name, 'Western Ave & Howard St', "Roswell B. Mason Elementary School")) %>%           
+        mutate(end_station_name = str_replace(end_station_name, 'Pulaski Rd & Lake St', "Pulaski Rd & 15th St")) %>%           
+        mutate(end_station_name = str_replace(end_station_name, 'Karlov Ave & Madison St', "California Ave & Ogden Ave")) %>%   
+        mutate(end_station_name = str_replace(end_station_name, 'Pulaski Rd & Congress Pkwy', "Zapata Academy")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Kostner Ave & Lake St', "Keeler Ave & 26th St")) %>%           
+        mutate(end_station_name = str_replace(end_station_name, 'Laramie Ave & Madison St', "Whipple St & 26th St")) %>%         
+        mutate(end_station_name = str_replace(end_station_name, 'Laramie Ave & Gladys Ave', "Cicero Ave & Roscoe St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Kostner Ave & Adams St', "Linder Ave & Belmont Ave")) %>%            
+        mutate(end_station_name = str_replace(end_station_name, 'Damen Ave & Pershing Rd', "Cicero Ave & Wellington Ave")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Marshfield Ave & 44th St', "Laramie Ave & Fullerton Ave")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Elizabeth St & 47th St', "Lorel Ave & Chicago Ave")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Damen Ave & 51st St', "Cicero Ave & Le Moyne St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Throop St & 52nd St', "Spencer Elementary Technology Academy")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Racine Ave & Garfield Blvd', "Menard Ave & Dakin St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Marshfield Ave & 59th St', "Austin Ave & Roscoe St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Damen Ave & 59th St', "Melvina Ave & Belmont Ave")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Racine Ave & 61st St', "Menard Ave & Belmont Ave")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Racine Ave & 65th St', "Austin Ave & Wellington Ave")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'May St & 69th St', "Harvey Ave & North Ave")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Woodlawn Ave & 75th St', "Menard Ave & Grand Ave")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Evans Ave & 75th St', "McVicker Ave & Grand Ave")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Vernon Ave & 75th St', "Austin Blvd & North Ave")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'State St & 76th St', "Hiawatha Park")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Cottage Grove Ave & 78th St', "Pittsburgh Ave & Irving Park")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Greenwood Ave & 79th St', "Plainfield Ave & Irving Park Rd")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Stony Island Ave & South Chicago Ave', "Ozark Ave & Addison St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Phillips Ave & 79th St', "Oketo Ave & Belmont Ave")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'MLK Jr Dr & 83rd St', "Stewart Ave & 123rd St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'South Chicago Ave & 83rd St', "Yale Ave & 119th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Kilbourn Ave & Irving Park Rd', "Ada St & 117th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Knox Ave & Montrose Ave', "Eggleston Ave & 115th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Halsted St & 59th St', "Wallace St & 112 St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Wabash Ave & 87th St', "Michigan Ave & 113th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Benson Ave & Church St', "Cottage Grove Ave & 111th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Valli Produce - Evanston Plaza', "Avenue J & 112th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Dodge Ave & Church St', "Ewing Ave & 112th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Sheridan Rd & Noyes St', "Wentworth Ave & 103rd St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'University Library', "Parnell Ave & 103rd St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Orleans St & Chestnut St', "Ada St & 95th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Michigan Ave & 8th St', "Halsted St & 102nd St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Malcolm X College', "Yates Ave & 100th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Orleans St & Hubbard St', "Ewing Ave & 101st St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Wood St & Chicago Ave', "Ewing Ave & 96th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Clinton St & Jackson Blvd', "Ewing Ave & Indianapolis Ave")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Lakefront Trail & Wilson Ave', "Ewing Ave & 99th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Latrobe Ave & Chicago Ave', "Justine St & 87th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Western Ave & Fillmore St', "Wabash Ave & 87th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'State St & 54th St', "Cottage Grove Ave & 87th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Stewart Ave & 63rd St', "Cottage Grove Ave & 92nd St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Eggleston Ave & 69th St', "Houston Ave & 91st St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Michigan Ave & 71st St', "Commercial Ave & 89th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Rhodes Ave & 71st St', "Muskegon Ave & 89th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Cornell Dr & Hayes Dr', "Loomis Blvd & 83rd St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Hoyne Ave & Balmoral Ave', "Sangamon St & 79th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Leavitt St & Division St', "King Dr & 83rd St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Evanston Civic Center', "Langley Ave & 79th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Dodge Ave & Mulford St', "Cottage Grove & 86th St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'South Chicago Ave & Elliot Ave', "83rd St Metra")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Green St & Randolph St', "Green St & Washington Blvd")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Bissell St & Armitage Ave', "Sheridan Rd & Argyle St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'WEST CHI-WATSON', "WestChi")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Base - 2132 W Hubbard Warehouse', "Base - 2132 W Hubbard")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Morgan St & Lake St', "Sangamon St & Lake St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'DuSable Lake Shore Dr & Ohio St', "McClurg Ct & Ohio St")) %>%          
+        mutate(end_station_name = str_replace(end_station_name, 'Lincoln Ave & Roscoe St', "Wood St & Webster Ave")) %>%
+        
+        group_by(start_station_id) %>%
+        #try and make lat and lng consistent as some are slightly off
+        
+        mutate(start_lat = mean(start_lat),
+               start_lng = mean(start_lng)) %>%
+        group_by(end_station_id) %>%
+        mutate(end_lat = mean(end_lat),
+               end_lng = mean(end_lng)) %>%
+        #round the lat and lng for each station to 2 digits
+        mutate(start_lat_area = round(start_lat, digits = 2),
+               start_lng_area = round(start_lng, digits = 2),
+               end_lat_area = round(end_lat, digits = 2),
+               end_lng_area = round(end_lng, digits = 2)) %>%
+        
+        #create a variable to calculate trip distance, note the distGeo is in meters, converted to miles
+        mutate(
+        trip_length = geosphere::distGeo(cbind(start_lng, start_lat), cbind(end_lng, end_lat)) /1609.35,
+        trip_change_x = geosphere::distGeo(cbind(start_lng, start_lat), cbind(end_lng, start_lat)) / 1609.35,
+        trip_change_y = geosphere::distGeo(cbind(start_lng, start_lat), cbind(start_lng, end_lat)) / 1609.35,
+        trip_change_x = if_else(end_lng > start_lng, trip_change_x, (-1)*trip_change_x),
+        trip_change_y = if_else(end_lat > start_lat, trip_change_y, (-1)*trip_change_y),
+        trip_speed = trip_length / TripDuration *60) %>%
+        filter(trip_speed < 44) %>%
+        ungroup()
+
+TripData2022 = TripData2022 %>% mutate(
+        WeekDayFactor = factor(WeekDay, levels=c("Sunday", "Monday", "Tuesday",
+                                                 "Wednesday", "Thursday",
+                                                 "Friday", "Saturday")))
+
+```
+
+## Some Quick Calculations on the Data
+
+We first calcualte the mean of the Trip Duration `r round(mean(TripData2022$TripDuration), digits =2)`. Then we calculate the maximum Trip Duration as `r round(max(TripData2022$TripDuration), digits =2)`. Below, we show these calculations in a table.
+
+```{r pivot table summary, echo = FALSE}
+pivtable1 = TripData2022 %>% group_by(member_casual) %>%
+        summarize(
+                mean_TripDuration = round(mean(TripDuration), digits=2)
+        )
+
+knitr::kable(pivtable1,
+             col.names = c("Member Type",
+                           "Mean Trip Duration (minutes)"
+                        ))
+```
+As the table shows, there is a difference in how long rides are between the two different groups. Casual riders on average have longer trips in terms of trip duration measured in minutes. We also present a graphic representation of the table below. 
+
+```{r Mean Trip Duration by Member type, echo=FALSE}
+#mean trip duration by member type
+TripData2022 %>% ggplot( aes(member_casual, TripDuration, fill = member_casual)) +
+        geom_bar(stat = "summary", 
+                 fun = "mean",
+                 ) +
+        geom_label(stat = 'summary',
+                  fun = 'mean',
+                  aes(y = stage(TripDuration, after_stat = y ),
+                      label = round(after_stat(y), digits = 1)),
+                  nudge_y = 1, fill = "#ebebeb", label.r = unit(0, "pt"),
+                  label.size = 0) + 
+        labs(x = "Member Type", y = "Mean Trip Duration in minutes") +
+        scale_fill_manual(values = c('blue', 'orange')) +
+        theme(legend.position = 'none')
+```
+
+We then move to showing the average trip duration by member type and day of the week. The table below shows the results.
+```{r pivot table trip duration by weekday, echo = FALSE}
+pivtable2 = TripData2022 %>% group_by(member_casual, WeekDayFactor) %>%
+        summarize (
+                mean_TripDuration = round(mean(TripDuration), digits =2)
+        ) %>%
+         arrange(WeekDayFactor)
+
+knitr::kable(pivtable2,
+             col.names = c("Member Type",
+                           "Weekday",
+                           "Mean Trip Duration (minutes)"))
+```
+As the table shows, we already knew that casual riders ride longer in minutes than members. That remains true no matter what weekday you compare between the two groups. Not surprisingly, both groups tend to take longer duration trips on the weekends (and Mondays for the casual riders). We show this table in graphic form below.
+
+```{r Mean Trip Duration by Day of Week & Member Type, echo = FALSE}
+#mean trip duration by member type & day week
+
+
+TripData2022 %>% ggplot(aes(WeekDayFactor, TripDuration, fill = member_casual)) +
+        geom_bar(stat = "summary",
+                 fun = "mean") +
+        geom_label(stat = 'summary',
+                   fun = 'mean',
+                   aes(y = stage(TripDuration, after_stat = y ),
+                       label = round(after_stat(y), digits = 1)),
+                   nudge_y = 1, fill = "#ebebeb", label.r = unit(0, "pt"),
+                   label.size = 0) +
+        labs(x = "Day of the Week", y = "Mean Trip Duration in minutes") +
+        scale_fill_manual(values = c('blue', 'orange')) +
+        theme(legend.position = 'none', axis.text.x = element_text(angle = 90)) +
+        facet_wrap(~ member_casual)
+
+```
+
+Next, we take a look at the number of rides taken by group and weekday. The table below shows the results.
+
+```{r pivot table trips by weekday, echo = FALSE}
+pivtable3 = TripData2022 %>% group_by(member_casual, WeekDayFactor) %>%
+        summarize (
+                number_Trips =n()
+        ) %>%
+        arrange(WeekDayFactor)
+
+
+knitr::kable(pivtable3,
+             col.names = c("Member Type",
+                           "Weekday",
+                           "# Trips"),
+             format.args = list(big.mark = ",")
+             )
+```
+Not surprisingly, members have taken more trips than casual riders. Members also have taken more trips during the week, while casual members have taken more rides during the weekend than they do during the week. Sunday is the only case where casual riders have taken more rides than members during this period of analysis.
+
+The graphic representation of the table is shown below.
+
+
+```{r # Trips by Weekday and member type, echo=FALSE}
+
+TripData2022 %>% ggplot( aes(WeekDayFactor)) +
+        geom_bar(aes( fill = member_casual), position = position_dodge()) +
+        geom_text(stat='count', aes(label=label_number(
+                accuracy = .1, scale=1e-3, suffix='K')(..count..), vjust = 1,
+                hjust = 2,
+                angle = 90, color = member_casual)) +
+        labs(x = "Day of the Week", y = "# Trips") +
+        scale_fill_manual(values = c('blue', 'orange')) +
+        theme(legend.position = 'none', axis.text.x = element_text(angle = 90)) +
+        scale_y_continuous(name = "# Trips (K)", labels = label_number(suffix='K', scale=1e-3))+
+        scale_color_manual(values = c("white", "black")) +
+
+        facet_wrap(~ member_casual)
+```
+
+## Sharing the Findings
+
+We point to the Tablue Story to show data...
+
+## Findings & Recommendations
+
+Our analysis shows that casual and member riders use bikes differently. Member riders are the majority of users in this time period (November 2021 through October 2022). However, casual riders are becoming larger users of the bikes. Casual ridership share peaked at just under 49% in July 2022 and then declined as seasons change and made up just under 37% of all rides in Octoer 2022.
+
+Casual riders overall make up the majority of rides on Saturdays (52%) and on Sundays they make up almost 49% of rides. Weekdays show that member riders make up the vast majority of rides. This suggests that member riders are using the bikes as commuting tools.Their trips are shorter in duration, ranging between 10 and 14 minutes.Casual riders, on the other hand, tend to take longer trips in muinutes on average ranging between almost 19 minutes and just over 28 minutes.
+
+Although the casual riders take longer trips in minutes on average than member riders, the trip length in miles is roughly the same. That said, we do not have data on the actual routes, so we estimated the trip langth using the latitude and longitude of the starting and ending stations. Data on actual trip distance may help us better understand how the casual and member riders differ.
+
+Further station usage is also different between the two rider types. There is some overlap between the two groups, the casual riders start and end near public parks or attractions, while the member riders tend to be in commercial ares. This suggests that member riders tend to use the bikes as commuting devices, while the casual riders are recreational.
+
+### Key Findings
+
+These are our key findings:
+
+* Member riders make up nearly 60% of all rides from November 2021 through October 2022
+* Casual riders are increasing their number of rides
+* Casual riders use the bikes most often on weekends
+* Casual riders on average have longer rides in minutes than member riders
+* Estimated trip length is roughly the same between groups
+* Casual riders appear to be recreational use, starting and ending near public parks or attractions
+* Member riders appear to use the bikes as commuting devices, starting and ending near commercial areas
+* Round trips (starting and ending at the same station) occur, but are not common. About 10% of casual riders are round trips, about 3% of member rides are round trips.
+* Docked bikes are used exclusively by casual riders
+* Electric bikes are becoming more popular across the rider groups
+* Classic bikes are the most popular for both groups.
+
+
+
+
+
+
